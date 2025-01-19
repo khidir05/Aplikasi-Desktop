@@ -15,18 +15,23 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.awt.image.BufferedImage;
+import java.io.*;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.math.BigInteger;
+import java.util.*;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.regex.Pattern;
+import javax.imageio.ImageIO;
 
 public class PDFConverter {
-    private static final Logger logger = LoggerFactory.getLogger(PDFConverter.class);
+    private static final String DEFAULT_FONT = "Calibri";
+    private final ArabicOCRProcessor arabicOCR;
+    private static final Pattern ARABIC_PATTERN = Pattern.compile("[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]+");
     private final Tesseract tesseract;
-    private static final double FONT_SIZE_SCALE = 1.0;
 
     // Kelas untuk menyimpan informasi teks
     private static class TextInfo {
@@ -88,6 +93,7 @@ public class PDFConverter {
 
     public PDFConverter() {
         tesseract = new Tesseract();
+        arabicOCR = new ArabicOCRProcessor();
         try {
             tesseract.setDatapath("C:/Program Files/Tesseract-OCR/tessdata");
             tesseract.setLanguage("eng+ind");
@@ -97,6 +103,10 @@ public class PDFConverter {
             logger.error("Error initializing Tesseract: ", e);
             throw new RuntimeException("Failed to initialize Tesseract", e);
         }
+    }
+
+    private boolean containsArabic(String text) {
+        return ARABIC_PATTERN.matcher(text).find();
     }
 
     public void convert(String inputPath, String outputPath, String password) throws Exception {
@@ -179,15 +189,35 @@ public class PDFConverter {
 
     private void processPageContent(XWPFDocument docx, List<TextInfo> textInfoList, 
                                   String ocrText, PDRectangle pageSize) {
-        Collections.sort(textInfoList, (a, b) -> Double.compare(a.y, b.y));
+        // Sort berdasarkan posisi Y dan X untuk menjaga urutan teks
+        Collections.sort(textInfoList, (a, b) -> {
+            int yCompare = Double.compare(a.y, b.y);
+            return yCompare != 0 ? yCompare : Double.compare(a.x, b.x);
+        });
         
         double currentY = -1;
         XWPFParagraph currentParagraph = null;
-
+        boolean isList = false;
+        
         for (TextInfo textInfo : textInfoList) {
-            if (currentY == -1 || Math.abs(textInfo.y - currentY) > 5) {
+            // Deteksi apakah ini adalah list item
+            isList = detectListItem(textInfo.text);
+            
+            // Buat paragraf baru jika:
+            // 1. Beda baris (y position berbeda)
+            // 2. Atau ini adalah list item
+            // 3. Atau ada jarak signifikan pada x position
+            if (currentY == -1 || 
+                Math.abs(textInfo.y - currentY) > 5 ||
+                isList ||
+                (currentParagraph != null && Math.abs(textInfo.x - getLastXPosition(currentParagraph)) > 50)) {
+                
                 currentParagraph = createNewParagraph(docx, textInfo, pageSize);
                 currentY = textInfo.y;
+                
+                if (isList) {
+                    formatAsList(currentParagraph, textInfo);
+                }
             }
             
             if (currentParagraph != null) {
@@ -195,8 +225,27 @@ public class PDFConverter {
             }
         }
 
+        // Proses hasil OCR jika ada
         if (!ocrText.trim().isEmpty()) {
-            addOCRText(docx, ocrText);
+            processOCRText(docx, ocrText);
+        }
+    }
+
+    private boolean detectListItem(String text) {
+        return text.matches("^[\\d•\\-\\*].*") || // Bullet points atau nomor
+               text.matches("^[a-zA-Z]\\).*") ||  // a) b) format
+               text.matches("^[\\d]+\\..*");      // 1. 2. format
+    }
+
+    private void formatAsList(XWPFParagraph paragraph, TextInfo textInfo) {
+        paragraph.setIndentationLeft(720); // 0.5 inch
+        paragraph.setIndentationHanging(360); // 0.25 inch
+        // Tambahkan bullet atau nomor sesuai dengan jenis list
+        if (textInfo.text.matches("^\\d+\\..*")) {
+            paragraph.setNumID(getNumberingId(paragraph.getDocument()));
+        } else {
+            paragraph.setIndentationLeft(720);
+            paragraph.setIndentationHanging(360);
         }
     }
 
@@ -218,10 +267,17 @@ public class PDFConverter {
     private void addFormattedText(XWPFParagraph paragraph, TextInfo textInfo) {
         XWPFRun run = paragraph.createRun();
         run.setText(textInfo.text);
+        run.setFontFamily(DEFAULT_FONT);
         run.setFontSize((int)(textInfo.fontSize * FONT_SIZE_SCALE));
-        run.setFontFamily(textInfo.fontFamily);
         run.setBold(textInfo.isBold);
         run.setItalic(textInfo.isItalic);
+        
+        // Jika text mengandung Arab, atur alignment ke kanan
+        if (containsArabic(textInfo.text)) {
+            paragraph.setAlignment(ParagraphAlignment.RIGHT);
+            // Tambahkan RTL marking untuk text arab
+            run.setText("\u200F" + textInfo.text);
+        }
     }
 
     private void addOCRText(XWPFDocument docx, String ocrText) {
@@ -240,4 +296,22 @@ public class PDFConverter {
             docx.write(out);
         }
     }
+    
+    private void processOCRText(XWPFDocument docx, String ocrText) {
+        String[] paragraphs = ocrText.split("\\n\\s*\\n");
+        for (String para : paragraphs) {
+            if (!para.trim().isEmpty()) {
+                XWPFParagraph paragraph = docx.createParagraph();
+                XWPFRun run = paragraph.createRun();
+                run.setText(para.trim());
+                run.setFontFamily(DEFAULT_FONT);
+                
+                if (containsArabic(para)) {
+                    paragraph.setAlignment(ParagraphAlignment.RIGHT);
+                    run.setText("\u200F" + para.trim());
+                }
+            }
+        }
+    }
+    
 }
